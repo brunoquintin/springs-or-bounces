@@ -101,9 +101,9 @@ them to whatever language your copy of After Effects runs in.
 3. Restart After Effects.
 4. Open it from the bottom of the `Window` menu: `Springs or Bounces.jsx`.
 5. In `Preferences > Scripting & Expressions`, enable **Allow Scripts to
-   Write Files and Access Network** — the pseudo-effect is written as a
-   temporary preset file at each application. The panel tells you if it's
-   missing and offers to open the preferences.
+   Write Files and Access Network** — the pseudo-effects are written once
+   as preset files in your user data folder (see below). The panel tells
+   you if it's missing and offers to open the preferences.
 
 You can also run it without installing, via `File > Scripts > Run Script
 File`, in which case it opens as a floating palette instead of a dockable
@@ -111,9 +111,16 @@ panel.
 
 ## Notes and limitations
 
-- The pseudo-effects are built in memory and applied as a temporary
-  `.ffx` preset, deleted immediately. Nothing to install alongside, no
-  plugin, no binary blob: this `.jsx` is the whole tool.
+- The pseudo-effects are built in memory and kept as two small `.ffx`
+  presets, `Springs.ffx` and `Bounces.ffx`, in a folder named after the
+  tool in your user data folder (`%APPDATA%\Springs or Bounces\` on
+  Windows, `~/Library/Application Support/Springs or Bounces/` on macOS),
+  written the first time and reused afterwards. Nothing to install
+  alongside, no plugin, no binary blob: this `.jsx` is the whole tool, and
+  that folder can be deleted at any time.
+- Effect names list the properties in timeline order (Anchor Point,
+  Position, Scale, Rotation, Opacity), whatever the order you selected
+  them in.
 - Every default and range is plain data near the top of the file
   (`FX_SPRINGS`, `FX_BOUNCES`) and can be edited in a text editor. Read the
   comments around them before changing the order of the controls.

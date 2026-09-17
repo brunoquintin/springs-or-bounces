@@ -1,6 +1,6 @@
 ﻿/*
 ================================================================================
-    Springs or Bounces  v1.5
+    Springs or Bounces  v1.6
     Physical follow-through for any keyframed property, in one click.
 
     Adobe After Effects script (ExtendScript, based on ECMAScript 3).
@@ -119,9 +119,10 @@
     HOW THE PSEUDO-EFFECTS ARE BUILT
     --------------------------------
     The two pseudo-effects are declared as plain data in this file
-    (FX_SPRINGS, FX_BOUNCES) and compiled into a .ffx preset in memory at
-    each application by the PseudoFX object below, applied, then the
-    temporary file is deleted. Nothing to install alongside, no binary blob,
+    (FX_SPRINGS, FX_BOUNCES) and compiled into a .ffx preset in memory by
+    the PseudoFX object below, written once to the user data folder
+    (<user data>/Springs or Bounces/Springs.ffx and Bounces.ffx), checked
+    and reused at each application. Nothing to install alongside, no binary blob,
     no external file: this .jsx is the whole tool. This is also why After
     Effects' "Allow Scripts to Write Files and Access Network" preference
     must be enabled -- the panel says so, and offers to open the preferences,
@@ -324,7 +325,7 @@
         return btn;
     }
 
-    function hasWriteFilesAccess() {// Check if the script may write files on disk, needed to write the temporary .ffx preset.
+    function hasWriteFilesAccess() {// Check if the script may write files on disk, needed to write the .ffx preset.
         app.preferences.saveToDisk();
         app.preferences.reload();
 
@@ -348,8 +349,8 @@
     }
 
     // PseudoFX -- compiles a declarative pseudo-effect spec (slider, checkbox
-    // and popup controls) into a .ffx preset in memory, applies it to a
-    // layer, then deletes the temporary file. No #include, no external file
+    // and popup controls) into a .ffx preset in memory, keeps it on disk
+    // in the user data folder and applies it to a layer. No #include, no external file
     // of any kind: this whole script is the unit of distribution and runs
     // unmodified on any machine, Windows or macOS.
     //
@@ -656,37 +657,146 @@
 
         // ---- public API ----
 
+        var MAX_APPLY_ATTEMPTS = 5;
+
+        // ---- the preset file ----
+        // The compiled preset is kept on disk and reused, one file per
+        // effect, named after it, in this tool's own folder under the
+        // user data folder (the usual home for what a script generates:
+        // %APPDATA% on Windows, ~/Library/Application Support on macOS):
+        //     <user data>/Springs or Bounces/Springs.ffx
+        // It is rewritten only when missing, unreadable, or not byte for
+        // byte what the spec compiles to (a changed spec or id is caught
+        // that way, whatever the file name). Writing a fresh file at every
+        // application was the fragile part: now and then After Effects
+        // could not open a file written an instant before ("File not
+        // found", best guess an antivirus scanning the new file), and a
+        // name reused across write/apply/delete cycles could get stuck in
+        // Windows' "delete pending" limbo. A file written once, checked,
+        // and left alone is never new again. Transient specs (DEV_MODE's
+        // throwaway ids) are deleted after use so they don't pile up.
+        // TOOL_FOLDER_NAME is the one thing to adapt when this PseudoFX
+        // object is copied into another tool.
+        var TOOL_FOLDER_NAME = "Springs or Bounces";
+
+        function presetFolder() {
+            var folder = new Folder(Folder.userData.fsName + "/" + TOOL_FOLDER_NAME);
+            if (!folder.exists && !folder.create()) {
+                folder = Folder.temp;   // fall back to the temp folder
+            }
+            return folder;
+        }
+
+        function presetFile(fx) {
+            var name = fx.name.replace(/[\\\/:*?"<>|]/g, "_");   // characters no file name may hold
+            return new File(presetFolder().fsName + "/" + name + ".ffx");
+        }
+
+        // Every .ffx After Effects writes carries the size of the comp it
+        // was exported from ("beso" chunk), the reference AE uses to
+        // rescale spatial values (Position, points) when the preset lands
+        // in a comp of another size. Slider, checkbox and popup controls
+        // have no spatial value, so the reference is irrelevant here --
+        // verified: a preset built at 1920x1080 applied in a 1080x1080
+        // comp gives identical defaults and ranges. A fixed size keeps the
+        // file identical whatever the comp.
+        var REF_WIDTH = 1920, REF_HEIGHT = 1080;
+
+        // "" when the file is there, readable and holds exactly data;
+        // otherwise what is wrong with it.
+        function presetFileState(file, data) {
+            if (!file.exists) { return "the file is missing"; }
+            if (file.length !== data.length) { return "the file is incomplete (" + file.length + " of " + data.length + " bytes)"; }
+            file.encoding = "BINARY";
+            if (!file.open("r")) { return "the file can't be opened for reading (" + file.error + ")"; }
+            var content = file.read();
+            file.close();
+            if (content !== data) { return "the file doesn't match the current spec"; }
+            return "";
+        }
+
+        // Makes sure file holds exactly data, writing it only when needed.
+        // Returns "" or what is still wrong after writing.
+        function ensurePreset(file, data) {
+            var state = presetFileState(file, data);
+            if (state === "") { return ""; }
+            file.encoding = "BINARY";
+            if (!file.open("w")) {
+                return "the file can't be written (" + file.error + ")";
+            }
+            file.write(data);
+            file.close();
+            return presetFileState(file, data);
+        }
+
         // Builds the preset for fx, applies it to one layer and returns the
         // applied effect (still carrying its default name, fx.name).
+        //
+        // applyPreset() on a file it can't open reports "File not found" in
+        // a dialog of its own and does NOT throw (only a path that doesn't
+        // exist at all throws), so the application is checked by the effect
+        // parade growing, with AE's dialogs suppressed meanwhile, and
+        // retried a few times with a growing pause. Only when every attempt
+        // fails is an error raised, saying what was wrong with the file.
         function applyTo(layer, fx) {
             var comp = layer.containingComp;
-
-            var file = new File(Folder.temp.fsName + "/_pfx_" + fx.id + ".ffx");
-            file.encoding = "BINARY";
-            file.open("w");
-            file.write(buildFFX(fx, comp.width, comp.height));
-            file.close();
+            sweepTempPresets();
+            var data = buildFFX(fx, REF_WIDTH, REF_HEIGHT);
+            var file = presetFile(fx);
 
             // applyPreset acts on the SELECTION, not on the layer it is called on.
             // Isolate the target, apply, then restore the previous selection.
+            var parade = layer.property("ADBE Effect Parade");
+            var countBefore = parade.numProperties;
             var sel = comp.selectedLayers;
             var i;
             for (i = 0; i < sel.length; i++) { sel[i].selected = false; }
             layer.selected = true;
-            layer.applyPreset(file);
-            layer.selected = false;
-            for (i = 0; i < sel.length; i++) { sel[i].selected = true; }
 
-            file.remove();
+            var problem = "";
+            try {
+                for (var attempt = 1; attempt <= MAX_APPLY_ATTEMPTS; attempt++) {
+                    problem = ensurePreset(file, data);
+                    if (problem === "") {
+                        app.beginSuppressDialogs();
+                        try {
+                            layer.applyPreset(file);
+                        } catch (err) {
+                            problem = err.message;
+                        } finally {
+                            app.endSuppressDialogs(false);
+                        }
+                        if (parade.numProperties === countBefore + 1) { break; }
+                        if (problem === "") { problem = "After Effects could not read it"; }
+                    }
+                    $.sleep(100 * attempt);
+                }
+            } finally {
+                layer.selected = false;
+                for (i = 0; i < sel.length; i++) { sel[i].selected = true; }
+                if (fx.transient) { file.remove(); }
+            }
 
+            if (parade.numProperties !== countBefore + 1) {
+                throw new Error("PseudoFX: the \"" + fx.name + "\" preset \"" + file.fsName + "\" could not be applied to layer \"" +
+                                layer.name + "\" after " + MAX_APPLY_ATTEMPTS + " attempts: " + problem + ".");
+            }
             // applyPreset appends to the effect parade, so the new effect is
             // the last one. Check its matchName rather than trust that blindly.
-            var parade = layer.property("ADBE Effect Parade");
             var applied = parade.property(parade.numProperties);
-            if (!applied || applied.matchName !== "Pseudo/" + fx.id) {
+            if (applied.matchName !== "Pseudo/" + fx.id) {
                 throw new Error("PseudoFX: could not find the applied \"" + fx.name + "\" effect on layer \"" + layer.name + "\".");
             }
             return applied;
+        }
+
+        // Deletes the "_pfx_*.ffx" temp files earlier builds left behind,
+        // ignoring any that can't be removed.
+        function sweepTempPresets() {
+            var stale = Folder.temp.getFiles("_pfx_*.ffx");
+            for (var i = 0; i < stale.length; i++) {
+                try { stale[i].remove(); } catch (e) {}
+            }
         }
 
         // Throwaway id, used only when DEV_MODE is on.
@@ -807,7 +917,7 @@
     }
 
     // Collects the selected properties that can use velocity, grouped by the
-    // layer they belong to (one group per layer, in selection order), and
+    // layer they belong to (one group per layer, in timeline order), and
     // flags whether a control layer is required (camera, light and 3D model
     // layers can't host a pseudo-effect).
     function collectProperties(comp) {
@@ -852,11 +962,36 @@
             group.properties.push(prop);
         }
 
+        // Timeline order, not selection order: layers top to bottom, and
+        // within a layer the properties as the timeline lists them (Anchor
+        // Point, Position, Scale, Rotation, Opacity...), so the effect names
+        // and the per-property controllers read like the timeline does.
+        groups.sort(function (a, b) { return a.layer.index - b.layer.index; });
+        validProps = [];
+        for (var g = 0; g < groups.length; g++) {
+            groups[g].properties.sort(compareTimelineOrder);
+            for (var k = 0; k < groups[g].properties.length; k++) {
+                validProps.push(groups[g].properties[k]);
+            }
+        }
+
         return {
             properties: validProps,
             groups: groups,
             needsControlLayer: needsControlLayer
         };
+    }
+
+    // Orders two properties of the same layer as the timeline shows them:
+    // by their index path from the layer (see propertyPath), compared
+    // level by level.
+    function compareTimelineOrder(a, b) {
+        var pa = propertyPath(a).path;
+        var pb = propertyPath(b).path;
+        for (var i = 0; i < pa.length && i < pb.length; i++) {
+            if (pa[i] !== pb[i]) { return pa[i] - pb[i]; }
+        }
+        return pa.length - pb.length;
     }
 
     // ---- the Control Layer ----
@@ -1034,7 +1169,7 @@
         var selectedData = collectProperties(comp);
         if (selectedData.properties.length === 0) { return; }
 
-        if (DEV_MODE) { fx.id = PseudoFX.devId(); }
+        if (DEV_MODE) { fx.id = PseudoFX.devId(); fx.transient = true; }
 
         var useControlLayer = options.controlLayer || selectedData.needsControlLayer;
 
@@ -1094,7 +1229,11 @@
                 }
             }
 
+            var hostIds = detached.hostIds.slice();
+            for (t = 0; t < targets.length; t++) { addUnique(hostIds, targets[t].host.id); }
+
             finishDetach(comp, detached);
+            refreshExpressions(comp, hostIds);
         } finally {
             app.endUndoGroup();
         }
@@ -1185,22 +1324,91 @@
 
     // ---- removal ----
 
-    // Every property under root (a layer or a property group) whose
-    // expression targets the controller named effectName, hosted as told
-    // by onControlLayer.
-    function collectControllerUsers(root, effectName, onControlLayer, out) {
+    // Calls callback(property, parsed) for every property under root (a
+    // layer or a property group) carrying an expression written by this
+    // script, parsed as by parseExpression().
+    function forEachDrivenProperty(root, callback) {
         for (var i = 1; i <= root.numProperties; i++) {
             var p = root.property(i);
             if (p.propertyType !== PropertyType.PROPERTY) {
-                collectControllerUsers(p, effectName, onControlLayer, out);
+                forEachDrivenProperty(p, callback);
                 continue;
             }
             if (!p.canSetExpression || p.expression === "") { continue; }
             var parsed = parseExpression(p.expression);
-            if (parsed && parsed.effectName === effectName && parsed.onControlLayer === onControlLayer) {
+            if (parsed) { callback(p, parsed); }
+        }
+    }
+
+    // Every property under root whose expression targets the controller
+    // named effectName, hosted as told by onControlLayer.
+    function collectControllerUsers(root, effectName, onControlLayer, out) {
+        forEachDrivenProperty(root, function (p, parsed) {
+            if (parsed.effectName === effectName && parsed.onControlLayer === onControlLayer) {
                 out.push(p);
             }
+        });
+    }
+
+    // ---- stale expression errors ----
+    // Changing a layer's effect parade (applyPreset(), effect.remove()) can
+    // make After Effects evaluate the expressions that point at that
+    // layer's effects while the parade is being rebuilt. An evaluation that
+    // runs before its target effect is back in place fails with "effect
+    // named ... not found", and AE keeps that error on display (yellow
+    // banner, warning icon on the property) even though the expression is
+    // intact and evaluates fine the next time. It hits at random, both
+    // properties written by the click and older ones sharing the same host
+    // -- and Remove on a property in that state has been seen to pop an
+    // "invalid index in indexed group" dialog. Any fresh evaluation clears
+    // the stale error, and reading valueAtTime() is one (no change to the
+    // project, nothing added to the undo history). So once the last parade
+    // change of a run is done, every expression of this script targeting a
+    // host touched by the run is evaluated once -- and again shortly after
+    // the click, from a scheduled task, because with multi-frame rendering
+    // on, the render can evaluate a snapshot taken mid-run after the script
+    // has returned, and leave the same stale error behind. hostIds holds
+    // the layer ids of those hosts (a removed Control Layer has no users).
+    var REFRESH_DELAYS_MS = [400, 1500];
+
+    function evaluateExpressions(comp, hostIds) {
+        function touched(id) {
+            for (var i = 0; i < hostIds.length; i++) { if (hostIds[i] === id) { return true; } }
+            return false;
         }
+        var ctrlLayer = findControlLayer(comp);
+        var ctrlId = ctrlLayer ? ctrlLayer.id : -1;
+        var time = comp.time;
+        for (var l = 1; l <= comp.numLayers; l++) {
+            var layer = comp.layer(l);
+            var layerId = layer.id;
+            forEachDrivenProperty(layer, function (p, parsed) {
+                if (touched(parsed.onControlLayer ? ctrlId : layerId)) {
+                    try { p.valueAtTime(time, false); } catch (e) {}
+                }
+            });
+        }
+    }
+
+    // Evaluates now, and schedules the same again after the click. The
+    // scheduled code runs as a string in the global scope, so it goes
+    // through a global hook (same technique as the panel rebuild below).
+    function refreshExpressions(comp, hostIds) {
+        evaluateExpressions(comp, hostIds);
+        if (typeof app.scheduleTask !== "function") { return; }
+        var compId = comp.id;
+        $.global.__springsOrBouncesRefresh = function () {
+            var item = app.project.itemByID(compId);
+            if (item instanceof CompItem) { evaluateExpressions(item, hostIds); }
+        };
+        for (var d = 0; d < REFRESH_DELAYS_MS.length; d++) {
+            app.scheduleTask("$.global.__springsOrBouncesRefresh();", REFRESH_DELAYS_MS[d], false);
+        }
+    }
+
+    function addUnique(list, value) {
+        for (var i = 0; i < list.length; i++) { if (list[i] === value) { return; } }
+        list.push(value);
     }
 
     // Detaches these properties from the controllers their expressions point
@@ -1239,11 +1447,13 @@
         //    for finishDetach(); the others are renamed after their users.
         var doomed = [];
         var touchedControlLayer = false;
+        var hostIds = [];
         for (c = 0; c < controllers.length; c++) {
             var ctrl = controllers[c];
             var fx = findEffect(ctrl.host, ctrl.name);
             if (!fx) { continue; }
             if (ctrl.onControlLayer) { touchedControlLayer = true; }
+            addUnique(hostIds, ctrl.host.id);
 
             var users = [];
             if (ctrl.onControlLayer) {
@@ -1270,7 +1480,7 @@
             }
         }
 
-        return { doomed: doomed, touchedControlLayer: touchedControlLayer };
+        return { doomed: doomed, touchedControlLayer: touchedControlLayer, hostIds: hostIds };
     }
 
     // Second half of a detach: deletes the orphaned controllers, then drops
@@ -1304,6 +1514,16 @@
         return out;
     }
 
+    // Runs one button action; an error surfaces with its line instead of
+    // as After Effects' bare "internal verification failure" dialog.
+    function guarded(action) {
+        try {
+            action();
+        } catch (e) {
+            alert("Springs or Bounces: " + e.message + (e.line ? " (line " + e.line + ")" : ""));
+        }
+    }
+
     // Remove button: undoes the script's work on the selected properties.
     // Properties with any other expression, or none, are left untouched.
     function removeFollowThrough() {
@@ -1315,7 +1535,9 @@
 
         app.beginUndoGroup("Remove Springs / Bounces");
         try {
-            finishDetach(comp, detachFromControllers(comp, props));
+            var detached = detachFromControllers(comp, props);
+            finishDetach(comp, detached);
+            refreshExpressions(comp, detached.hostIds);
         } finally {
             app.endUndoGroup();
         }
@@ -1413,15 +1635,15 @@
         var btnHelp = addSvgButton(btnGroup, SVG_HELP_CMDS, SVG_HELP_W, SVG_HELP_H, 6, "How this panel works.");
 
         btnSprings.onClick = function (event) {
-            applySprings(clickOptions(event));
+            guarded(function () { applySprings(clickOptions(event)); });
         };
 
         btnBounces.onClick = function (event) {
-            applyBounces(clickOptions(event));
+            guarded(function () { applyBounces(clickOptions(event)); });
         };
 
         btnRemove.onClick = function () {
-            removeFollowThrough();
+            guarded(removeFollowThrough);
         };
 
         btnHelp.onClick = function () {
