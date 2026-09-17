@@ -5,6 +5,8 @@ one click. Select keyframed properties, click **Springs** or **Bounces**:
 each property gets an expression, and a pseudo-effect appears in the
 Effect Controls to tune it.
 
+<img src="screen-springbounce.png" alt="The Springs or Bounces panel: Springs, Bounces, Remove and ? buttons" />
+
 - **Springs** — Amplitude, Frequency, Number of springs, Extra damping,
   Rebounds. The property overshoots where it arrives and oscillates around
   it, like the end of a spring.
